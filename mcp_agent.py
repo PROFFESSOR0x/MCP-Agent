@@ -310,6 +310,8 @@ def parse_args():
     ap.add_argument("--token", default=os.environ.get("MCP_AUTH_TOKEN"), help=T("h_token"))
     ap.add_argument("--domain", default=None, help=T("h_domain"))
     ap.add_argument("--save-domain", metavar="DOMAIN", help="Save a static ngrok domain for future runs")
+    ap.add_argument("--save-token", action="store_true", help="Persist the MCP auth token in ~/.mcp-agent/.env")
+    ap.add_argument("--new-token", action="store_true", help="Generate and persist a new MCP auth token")
     ap.add_argument("--auto", action="store_true", help="Use saved MCP-Agent settings")
     ap.add_argument("--random-url", action="store_true", help="Ignore saved static domain for this run only")
     ap.add_argument("--show-config", action="store_true", help="Show saved settings with secrets redacted")
@@ -321,7 +323,7 @@ def parse_args():
     ap.add_argument("--lang", "-lang", default=LANG, choices=["ar", "en"], help=T("h_lang"))
     cfg = ap.parse_args()
     if cfg.show_config:
-        print(f"Config: {ENV_FILE}\nLogs: {LOG_DIR}\nAUTO_NGROK={os.environ.get('AUTO_NGROK', 'false')}\nNGROK_DOMAIN={os.environ.get('NGROK_DOMAIN', '(not set)')}\nNGROK_AUTHTOKEN={'[configured]' if (os.environ.get('NGROK_AUTHTOKEN') or cfg.ngrok_authtoken) else '(not set)'}")
+        print(f"Config: {ENV_FILE}\nLogs: {LOG_DIR}\nAUTO_NGROK={os.environ.get('AUTO_NGROK', 'false')}\nNGROK_DOMAIN={os.environ.get('NGROK_DOMAIN', '(not set)')}\nPERSIST_MCP_TOKEN={os.environ.get('PERSIST_MCP_TOKEN', 'false')}\nMCP_AUTH_TOKEN={'[configured]' if (os.environ.get('MCP_AUTH_TOKEN') or cfg.token) else '(not set)'}\nNGROK_AUTHTOKEN={'[configured]' if (os.environ.get('NGROK_AUTHTOKEN') or cfg.ngrok_authtoken) else '(not set)'}")
         raise SystemExit(0)
     if cfg.logs:
         files = sorted(LOG_DIR.glob("*.log")) if LOG_DIR.exists() else []
@@ -343,6 +345,29 @@ def parse_args():
         cfg.domain = saved_domain
     if cfg.random_url:
         cfg.domain = None
+
+    # A persisted MCP token is opt-in for backwards compatibility. Once enabled,
+    # reuse it unless the caller explicitly supplies --token or asks for rotation.
+    if cfg.new_token:
+        cfg.token = secrets.token_urlsafe(32)
+        save_env_value("MCP_AUTH_TOKEN", cfg.token)
+        save_env_value("PERSIST_MCP_TOKEN", "true")
+        print(f"Generated and saved a new MCP token in {ENV_FILE}. Keep it secret.")
+        raise SystemExit(0)
+    if cfg.save_token:
+        if cfg.token:
+            save_env_value("MCP_AUTH_TOKEN", cfg.token)
+        elif not os.environ.get("MCP_AUTH_TOKEN"):
+            save_env_value("MCP_AUTH_TOKEN", secrets.token_urlsafe(32))
+        save_env_value("PERSIST_MCP_TOKEN", "true")
+        print(f"MCP token persistence enabled in {ENV_FILE}. Keep the token secret.")
+        raise SystemExit(0)
+    if cfg.token:
+        if os.environ.get("PERSIST_MCP_TOKEN", "false").lower() in ("1", "true", "yes", "on") and not cfg.new_token:
+            # Explicit --token / MCP_AUTH_TOKEN has priority; only persist explicit CLI values.
+            pass
+    elif os.environ.get("PERSIST_MCP_TOKEN", "false").lower() in ("1", "true", "yes", "on"):
+        cfg.token = os.environ.get("MCP_AUTH_TOKEN")
 
     cfg.access = "read-only" if cfg.access == "readonly" else cfg.access
 
