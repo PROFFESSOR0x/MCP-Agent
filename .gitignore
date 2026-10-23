@@ -4,6 +4,9 @@ __py_cache__/
 *.py[cod]
 *$py.class
 
+# Logs
+.mcp-agent
+
 # Virtual environments
 .venv/
 venv/
