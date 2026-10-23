@@ -33,6 +33,7 @@ import re
 import asyncio
 import functools
 from pathlib import Path
+from typing import Any
 
 try:  # keep Arabic output working on Windows consoles
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -202,6 +203,8 @@ REQUIRED = {  # module name : pip spec
     "pyngrok": "pyngrok>=7.0",
     "uvicorn": "uvicorn>=0.30",
     "starlette": "starlette",
+    "PIL": "Pillow>=10.0",
+    "pymupdf": "PyMuPDF>=1.24",
 }
 VENV_DIR = Path.home() / ".claude_agent_mcp" / "venv"
 BOOT_FLAG = "MCP_AGENT_BOOT"
@@ -583,7 +586,7 @@ def _apply_unified_diff(path, patch_text):
 
 
 def build_server(cfg):
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp import FastMCP, Image as MCPImage
     from mcp.types import ToolAnnotations
     try:
         from mcp.server.transport_security import TransportSecuritySettings
@@ -613,6 +616,7 @@ def build_server(cfg):
     if ts is not None:
         kwargs["transport_security"] = ts
     mcp = FastMCP(APP_NAME, **kwargs)
+    tool_registry = {}
 
     # ---------------- helpers ----------------
     def resolve(p, must_exist=False):
@@ -650,6 +654,7 @@ def build_server(cfg):
 
     def reg(fn, read_only=False, destructive=False, open_world=False):
         f = audited(fn)
+        tool_registry[fn.__name__] = f
         try:
             ann = ToolAnnotations(readOnlyHint=read_only, destructiveHint=destructive,
                                   idempotentHint=read_only, openWorldHint=open_world)
@@ -702,12 +707,70 @@ def build_server(cfg):
                     break
         return f"{base}\n" + ("\n".join(lines) if lines else T("empty_dir"))
 
-    def read_file(path: str, start_line: int = 1, max_lines: int = 2000) -> str:
-        """Read a text file with line numbers (format: 'N<TAB>text'). Use start_line/max_lines to page through big files.
-        Line number prefixes are NOT part of the file content."""
+    def _image_result(data: bytes):
+        """Normalize image bytes for vision-capable MCP clients."""
+        from PIL import Image as PILImage, ImageOps
+        import io
+        with PILImage.open(io.BytesIO(data)) as source:
+            source.seek(0)
+            image = ImageOps.exif_transpose(source.copy())
+            image.thumbnail((2200, 2200), PILImage.Resampling.LANCZOS)
+            has_alpha = image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info)
+            output = io.BytesIO()
+            if has_alpha:
+                image.convert("RGBA").save(output, format="PNG", optimize=True)
+                fmt = "png"
+            else:
+                image.convert("RGB").save(output, format="JPEG", quality=86, optimize=True)
+                fmt = "jpeg"
+            return MCPImage(data=output.getvalue(), format=fmt)
+
+    def read_file(path: str, start_line: int = 1, max_lines: int = 2000,
+                  page_start: int = 1, page_end: int | None = None):
+        """Read text files, attach images as MCP image content, or render selected PDF pages as images.
+        PDF pages are 1-based; page_end is inclusive. Omit page_end to read only page_start.
+        At most 8 PDF pages per call. Visual pages let vision models inspect scanned PDFs, handwriting and diagrams.
+        Text files use start_line/max_lines as before; line-number prefixes are not part of file content."""
         p = resolve(path, must_exist=True)
         if not p.is_file():
             raise IsADirectoryError(T("not_file", p=p))
+        suffix = p.suffix.lower()
+        image_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+        if suffix in image_suffixes:
+            if p.stat().st_size > 40 * 1024 * 1024:
+                raise ValueError("Image exceeds the 40 MiB input limit")
+            image = _image_result(p.read_bytes())
+            return [f"Image file: {p} ({p.stat().st_size} bytes). The image is attached below for visual inspection.", image]
+
+        if suffix == ".pdf":
+            import pymupdf
+            if p.stat().st_size > 100 * 1024 * 1024:
+                raise ValueError("PDF exceeds the 100 MiB input limit")
+            if page_start < 1:
+                raise ValueError("page_start must be >= 1 (PDF pages are 1-based)")
+            doc = pymupdf.open(str(p))
+            try:
+                total = len(doc)
+                end = page_start if page_end is None else page_end
+                if end < page_start:
+                    raise ValueError("page_end must be greater than or equal to page_start")
+                if page_start > total or end > total:
+                    raise ValueError(f"PDF has {total} pages; requested range {page_start}-{end} is out of bounds")
+                if end - page_start + 1 > 8:
+                    raise ValueError("Read at most 8 PDF pages per call; split larger ranges into multiple calls")
+                results = [f"PDF: {p}\nTotal pages: {total}\nRendered pages: {page_start}-{end}. Each page is attached as an image for visual inspection."]
+                for page_number in range(page_start, end + 1):
+                    page = doc.load_page(page_number - 1)
+                    rect = page.rect
+                    longest_side = max(float(rect.width), float(rect.height), 1.0)
+                    scale = min(1.5, 2200.0 / longest_side)
+                    pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
+                    results.append(f"PDF page {page_number} of {total}:")
+                    results.append(_image_result(pix.tobytes("png")))
+                return results
+            finally:
+                doc.close()
+
         with open(p, "rb") as fb:
             if b"\0" in fb.read(8192):
                 return T("binary", n=p.stat().st_size)
@@ -870,6 +933,96 @@ def build_server(cfg):
 
         reg(run_command, destructive=True, open_world=True)
         reg(run_python, destructive=True, open_world=True)
+
+    async def parallel(calls: list[dict[str, Any]]):
+        """Run up to 8 available MCP tools concurrently.
+        Each call is {"tool": "tool_name", "arguments": {...}}. Results retain input order.
+        Only tools enabled by the current access level can be invoked. Nested parallel calls are rejected.
+        Do not parallelize dependent steps or concurrent writes to the same file."""
+        if not isinstance(calls, list) or not calls:
+            raise ValueError("calls must be a non-empty list of tool call objects")
+        if len(calls) > 8:
+            raise ValueError("parallel accepts at most 8 tool calls per batch")
+        prepared = []
+        for index, item in enumerate(calls):
+            if not isinstance(item, dict):
+                raise ValueError(f"calls[{index}] must be an object")
+            name = item.get("tool")
+            args = item.get("arguments", {})
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"calls[{index}].tool must be a tool name")
+            if name == "parallel":
+                raise ValueError("Nested parallel calls are not supported")
+            if name not in tool_registry:
+                raise ValueError(f"Tool {name!r} is not available at the current access level")
+            if not isinstance(args, dict):
+                raise ValueError(f"calls[{index}].arguments must be an object")
+            prepared.append((name, args))
+
+        async def invoke(name, args):
+            fn = tool_registry[name]
+            try:
+                if asyncio.iscoroutinefunction(fn):
+                    result = await fn(**args)
+                else:
+                    result = await asyncio.to_thread(fn, **args)
+                return name, True, result
+            except Exception as exc:
+                return name, False, f"{type(exc).__name__}: {exc}"
+
+        completed = await asyncio.gather(*(invoke(name, args) for name, args in prepared))
+        output = []
+        image_count = 0
+        remaining_chars = MAX_OUT
+        text_truncated = False
+
+        def add_text(value):
+            nonlocal remaining_chars, text_truncated
+            if text_truncated:
+                return
+            value = str(value)
+            if len(value) <= remaining_chars:
+                output.append(value)
+                remaining_chars -= len(value)
+                return
+            marker = "\n[Parallel text output truncated at 30,000 characters]"
+            if remaining_chars <= len(marker):
+                output.append(marker[:remaining_chars])
+            else:
+                keep = remaining_chars - len(marker)
+                output.append(value[:keep])
+                output.append(marker)
+            remaining_chars = 0
+            text_truncated = True
+
+        for index, (name, ok, result) in enumerate(completed, 1):
+            add_text(f"[{index}/{len(completed)}] {name}: {'OK' if ok else 'ERROR'}")
+            if not ok:
+                add_text(str(result))
+                continue
+            items = result if isinstance(result, (list, tuple)) else [result]
+            for item in items:
+                if isinstance(item, MCPImage):
+                    image_count += 1
+                    if image_count <= 12:
+                        output.append(item)
+                    elif image_count == 13:
+                        add_text("[Image output limit reached: only the first 12 images from this batch are attached]")
+                elif isinstance(item, str):
+                    add_text(item)
+                else:
+                    add_text(item)
+        return output
+
+    parallel_fn = audited(parallel)
+    try:
+        parallel_annotations = ToolAnnotations(readOnlyHint=not can_write and not can_exec,
+                                               destructiveHint=can_write or can_exec,
+                                               idempotentHint=False,
+                                               openWorldHint=can_exec)
+        mcp.tool(annotations=parallel_annotations)(parallel_fn)
+    except TypeError:
+        mcp.tool()(parallel_fn)
 
     return mcp
 

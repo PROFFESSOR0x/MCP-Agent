@@ -19,7 +19,8 @@ Read files, search your project, edit content, and run commands through a local 
 Run `mcp_agent.py` and connect any client that supports Remote MCP to your computer, including compatible Claude and ChatGPT clients. The server can expose tools to:
 
 - Browse directories and find files.
-- Read files and search their text using regular expressions.
+- Read text files, send image files to vision-capable models, and render selected PDF pages—including scanned pages—as image content.
+- Search text using regular expressions.
 - Create, edit, and patch files with contextual unified diffs, then move or delete them (depending on access level).
 - Run shell commands and Python snippets (unless disabled).
 - Expose the MCP endpoint through ngrok, or run locally without a public tunnel.
@@ -50,7 +51,7 @@ python mcp_agent.py --lang ar
 python mcp_agent.py --lang en
 ```
 
-On first launch, the program checks its dependencies and installs missing packages. On Linux/macOS, it normally creates a dedicated virtual environment at `~/.claude_agent_mcp/venv` and re-launches itself inside it. This legacy directory name is retained for compatibility with existing installations. If ngrok is enabled and is not configured, follow the prompts to authenticate.
+On first launch, the program checks its dependencies and installs missing packages, including Pillow for image normalization and PyMuPDF for PDF page rendering. On Linux/macOS, it normally creates a dedicated virtual environment at `~/.claude_agent_mcp/venv` and re-launches itself inside it. This legacy directory name is retained for compatibility with existing installations. If ngrok is enabled and is not configured, follow the prompts to authenticate.
 
 ## Language selection
 
@@ -108,9 +109,10 @@ Use `full` only when necessary, and run the process under an OS account with onl
 |---|---|:---:|:---:|:---:|
 | `get_access_info` | Report access level, workspace, OS, and enabled capabilities | Yes | Yes | Yes |
 | `list_directory` | List directory entries, optionally recursively | Yes | Yes | Yes |
-| `read_file` | Read a text file with line numbers | Yes | Yes | Yes |
+| `read_file` | Read text files, attach image files as vision content, or render selected PDF pages as images (including scanned PDFs) | Yes | Yes | Yes |
 | `find_files` | Find files by name or glob | Yes | Yes | Yes |
 | `search_text` | Search text with a regular expression | Yes | Yes | Yes |
+| `parallel` | Run up to 8 enabled tools concurrently; results preserve request order | Yes | Yes | Yes |
 | `write_file` | Create or overwrite a file | No | Yes | Yes |
 | `edit_file` | Replace an exact text segment | No | Yes | Yes |
 | `apply_patch` | Apply strict, contextual unified-diff hunks to one existing UTF-8 text file | No | Yes | Yes |
@@ -121,6 +123,33 @@ Use `full` only when necessary, and run the process under an OS account with onl
 | `run_python` | Run a Python snippet | No | Yes* | Yes* |
 
 `*` Execution tools are disabled when `--no-exec` is set.
+
+### Visual reads: images and PDFs
+
+`read_file` returns image files as native MCP image content so vision-capable clients can inspect the image directly. For PDFs, it renders pages as images instead of relying only on embedded text; this supports scanned documents, handwriting, tables, and diagrams without a separate OCR dependency. Images are normalized and resized before being attached.
+
+- `read_file(path="scan.png")` — attach an image.
+- `read_file(path="scan.pdf", page_start=3)` — render page 3 only.
+- `read_file(path="scan.pdf", page_start=3, page_end=6)` — render pages 3–6 inclusive.
+- PDF page numbers start at 1; one call can return up to 8 pages. Split larger ranges across calls.
+- Inputs are limited to 40 MiB per image and 100 MiB per PDF. PDF output is bounded to 8 pages per call.
+- The client/model must support MCP image content and vision to interpret the returned images.
+
+### `parallel`
+
+Use `parallel` for independent tool calls that do not depend on each other's results. Pass a list of objects with `tool` and optional `arguments` fields:
+
+```json
+{
+  "calls": [
+    {"tool": "list_directory", "arguments": {"path": "."}},
+    {"tool": "search_text", "arguments": {"path": ".", "pattern": "TODO", "glob": "*.py"}},
+    {"tool": "read_file", "arguments": {"path": "README.md", "start_line": 1, "max_lines": 30}}
+  ]
+}
+```
+
+Up to 8 calls execute concurrently; results are presented in the same order as the input. Each call is checked against the tools available at the current access level, and individual failures are reported without discarding other results. Nested `parallel` calls are rejected. Do not run dependent steps in the same batch or concurrently write to the same file. Image results from parallel reads are also returned as image content (up to 12 images per batch); aggregate text output is capped at 30,000 characters.
 
 ### `apply_patch`
 
