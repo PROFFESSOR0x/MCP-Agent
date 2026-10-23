@@ -1,1 +1,9 @@
-/__pycache__
+# Python bytecode and cache directories
+__pycache__/
+__py_cache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/

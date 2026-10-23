@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🍯 Claude Agent MCP
+# 🍯 MCP-Agent
 
 **Turn any chatbot that supports Remote MCP into an AI agent on your computer.**
 
@@ -16,7 +16,7 @@ Read files, search your project, edit content, and run commands through a local 
 
 ## What it does
 
-Run `mcp_agent.py` and connect an MCP-compatible client (for example, Claude.ai) to your computer. The server can expose tools to:
+Run `mcp_agent.py` and connect any client that supports Remote MCP to your computer, including compatible Claude and ChatGPT clients. The server can expose tools to:
 
 - Browse directories and find files.
 - Read files and search their text using regular expressions.
@@ -50,7 +50,7 @@ python mcp_agent.py --lang ar
 python mcp_agent.py --lang en
 ```
 
-On first launch, the program checks its dependencies and installs missing packages. On Linux/macOS, it normally creates a dedicated virtual environment at `~/.claude_agent_mcp/venv` and re-launches itself inside it. If ngrok is enabled and is not configured, follow the prompts to authenticate.
+On first launch, the program checks its dependencies and installs missing packages. On Linux/macOS, it normally creates a dedicated virtual environment at `~/.claude_agent_mcp/venv` and re-launches itself inside it. This legacy directory name is retained for compatibility with existing installations. If ngrok is enabled and is not configured, follow the prompts to authenticate.
 
 ## Language selection
 
@@ -76,9 +76,9 @@ The language option changes the command-line messages and help text. MCP tool na
 ## Connect a remote MCP client
 
 1. Start the server and copy the complete Connector URL printed in the terminal. With ngrok it resembles `https://your-domain.ngrok-free.app/<TOKEN>/mcp`.
-2. In Claude.ai, open **Settings → Connectors → Add custom connector**.
+2. In your MCP client, open its connector or developer settings and add a custom Remote MCP connector. In Claude.ai, this is **Settings → Connectors → Add custom connector**; other clients may use a different setup flow or require specific account settings.
 3. Paste the URL as printed. The token is embedded in this URL, so treat the entire URL as a secret.
-4. Enable the connector in a conversation and try asking it to list files in your workspace.
+4. Enable the connector in a conversation and try asking it to list files in your workspace. ChatGPT support depends on the available MCP connector features and account/workspace settings.
 
 Clients that support bearer authorization can instead use the base endpoint ending in `/mcp` with `Authorization: Bearer <TOKEN>`.
 
@@ -195,5 +195,7 @@ MCP client ── HTTPS ──> ngrok (optional) ──> AuthASGI ──> FastMC
 <div align="center">
 
 Made with care 🍯 · **Powerful access should be granted deliberately.**
+
+**by ProfessorX**
 
 </div>

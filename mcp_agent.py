@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mcp_agent.py  -  Turn any chatbot that supports Remote MCP (e.g. Claude.ai) into a real AI agent
+MCP-Agent  -  Turn any chatbot that supports Remote MCP (including compatible Claude and ChatGPT clients) into a real AI agent
 that reads/edits files and runs code on your machine, with access levels, a public URL and an Auth Token.
-حوّل أي chatbot يدعم Remote MCP (مثل Claude.ai) إلى AI Agent يقرأ الملفات ويعدلها وينفذ الأكواد على جهازك.
+حوّل أي chatbot يدعم Remote MCP، بما في ذلك العملاء المتوافقون مع Claude وChatGPT، إلى وكيل ذكاء اصطناعي يقرأ الملفات ويعدلها وينفذ الأكواد على جهازك.
 
 Examples / أمثلة:
   python mcp_agent.py                                          # read-only (whole machine / الجهاز كله)
@@ -62,8 +62,8 @@ S = {
     "installing": ("[+] تثبيت المكتبات ...", "[+] Installing packages ..."),
     "direct_fail": ("[!] التثبيت المباشر لم ينجح، سأستخدم venv ...", "[!] Direct install failed, falling back to a venv ..."),
     # arguments
-    "desc": ("MCP server يحوّل أي chatbot إلى agent (قراءة/كتابة/تنفيذ) مع ngrok و Auth Token",
-             "MCP server that turns any chatbot into an agent (read/write/execute) with ngrok and an Auth Token"),
+    "desc": ("MCP-Agent: خادم MCP لربط مساعدات الذكاء الاصطناعي المتوافقة بجهازك، مع صلاحيات قراءة/كتابة/تنفيذ ومصادقة آمنة",
+             "MCP-Agent by ProfessorX: Connect MCP-compatible AI assistants to your computer with access controls and token authentication"),
     "h_access": ("مستوى الصلاحيات:\n"
                  "  read-only : قراءة أي ملف في الجهاز، بدون كتابة أو تنفيذ (الافتراضي)\n"
                  "  operate   : قراءة + كتابة + تنفيذ داخل مجلد --workspace فقط (مطلوب)\n"
@@ -146,14 +146,14 @@ S = {
     "on": ("مفعّل", "enabled"),
     "off": ("معطّل", "disabled"),
     "b_ws": ("  Workspace  : {w}", "  Workspace  : {w}"),
-    "b_url": ("\n  🔗 رابط الـ Connector (ضعه كما هو في Claude.ai):\n     {u}",
-              "\n  🔗 Connector URL (paste it as-is into Claude.ai):\n     {u}"),
+    "b_url": ("\n  🔗 رابط MCP Connector (أضفه إلى عميل يدعم Remote MCP):\n     {u}",
+              "\n  🔗 MCP Connector URL (add it to a client that supports Remote MCP):\n     {u}"),
     "b_tok": ("\n  🔑 Auth Token:\n     {t}", "\n  🔑 Auth Token:\n     {t}"),
-    "b_how1": ("\n  طريقة الإضافة في Claude.ai:", "\n  How to add it in Claude.ai:"),
-    "b_how2": ("   Settings ▸ Connectors ▸ Add custom connector ▸ الصق الرابط أعلاه",
-               "   Settings ▸ Connectors ▸ Add custom connector ▸ paste the URL above"),
-    "b_how3": ("   (اترك خانات OAuth فارغة؛ التوكن موجود داخل الرابط).",
-               "   (leave the OAuth fields empty; the token is already inside the URL)."),
+    "b_how1": ("\n  طريقة الإضافة:", "\n  How to connect:"),
+    "b_how2": ("   أضف الرابط من إعدادات Connectors / Remote MCP في العميل الذي تستخدمه.",
+               "   Add the URL from your client’s Connectors / Remote MCP settings."),
+    "b_how3": ("   (إذا كان العميل يدعم Bearer Token، يمكنك استخدام الهيدر بدلًا من تضمينه في الرابط).",
+               "   (If your client supports bearer authentication, use the header instead of embedding the token in the URL)."),
     "b_hdr": ("  للعملاء الذين يدعمون الهيدرات: {b}/mcp  مع  Authorization: Bearer <token>",
               "  For clients that support headers: {b}/mcp  with  Authorization: Bearer <token>"),
     "b_w_op1": ("\n  ⚠ تنبيه: أدوات الملفات محصورة بالـ workspace، لكن run_command يشغّل أوامر نظام عادية",
@@ -194,7 +194,7 @@ def T(key, **kw):
 # ----------------------------------------------------------------------------
 # 1) Settings and requirements
 # ----------------------------------------------------------------------------
-APP_NAME = "claude-agent-mcp"
+APP_NAME = "MCP-Agent"
 REQUIRED = {  # module name : pip spec
     "mcp": "mcp>=1.10,<2",
     "pyngrok": "pyngrok>=7.0",
@@ -349,7 +349,7 @@ def bootstrap():
 
 # ----------------------------------------------------------------------------
 # 4) Protection layer: Auth Token (pure ASGI, no external libs)
-#    Claude.ai cannot send custom headers, so the token goes in the URL path:
+#    Some MCP clients cannot send custom headers, so the token can go in the URL path:
 #       https://xxxx.ngrok-free.app/<TOKEN>/mcp
 #    We also accept  Authorization: Bearer <TOKEN>  for clients that support it.
 # ----------------------------------------------------------------------------
