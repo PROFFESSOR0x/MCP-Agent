@@ -20,7 +20,7 @@ Run `mcp_agent.py` and connect any client that supports Remote MCP to your compu
 
 - Browse directories and find files.
 - Read files and search their text using regular expressions.
-- Create, edit, move, and delete files (depending on access level).
+- Create, edit, and patch files with contextual unified diffs, then move or delete them (depending on access level).
 - Run shell commands and Python snippets (unless disabled).
 - Expose the MCP endpoint through ngrok, or run locally without a public tunnel.
 
@@ -113,6 +113,7 @@ Use `full` only when necessary, and run the process under an OS account with onl
 | `search_text` | Search text with a regular expression | Yes | Yes | Yes |
 | `write_file` | Create or overwrite a file | No | Yes | Yes |
 | `edit_file` | Replace an exact text segment | No | Yes | Yes |
+| `apply_patch` | Apply strict, contextual unified-diff hunks to one existing UTF-8 text file | No | Yes | Yes |
 | `make_directory` | Create a directory | No | Yes | Yes |
 | `move_path` | Move or rename a path | No | Yes | Yes |
 | `delete_path` | Delete a file or directory | No | Yes | Yes |
@@ -120,6 +121,22 @@ Use `full` only when necessary, and run the process under an OS account with onl
 | `run_python` | Run a Python snippet | No | Yes* | Yes* |
 
 `*` Execution tools are disabled when `--no-exec` is set.
+
+### `apply_patch`
+
+Use `apply_patch` for code changes that need surrounding context, multiple edits, or precise line-level modifications. It accepts a unified diff for **one existing UTF-8 text file**. Standard `---` / `+++` headers are optional; one or more `@@` hunks are required.
+
+```diff
+--- a/example.py
++++ b/example.py
+@@ -1,3 +1,4 @@
+ def greet(name):
+-    return f"Hello {name}"
++    message = f"Hello {name}"
++    return message
+```
+
+The tool validates every hunk against the current file and fails without changing the file if any context does not match. It writes through a temporary file and atomic replacement after all hunks validate. It does not create or delete files; use `write_file` for new files. The target path is still checked against the active access level, and the tool is only available in `operate` and `full` modes.
 
 ## Command-line options
 

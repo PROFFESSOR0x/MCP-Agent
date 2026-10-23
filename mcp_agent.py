@@ -21,6 +21,8 @@ import os
 import sys
 import subprocess
 import shutil
+import tempfile
+import stat
 import importlib
 import importlib.util
 import secrets
@@ -402,7 +404,7 @@ class AuthASGI:
 # 5) MCP server and tools
 # ----------------------------------------------------------------------------
 MAX_OUT = 30000
-SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".mypy_cache", ".pytest_cache"}
+SKIP_DIRS = {".git", "node_modules", "__pycache__", "__py_cache__", ".venv", "venv", ".mypy_cache", ".pytest_cache"}
 
 
 def _trunc(s, limit=MAX_OUT):
@@ -460,6 +462,126 @@ def _exec(args, shell, cwd, timeout):
     return head + "\n" + _trunc(out or "")
 
 
+
+def _apply_unified_diff(path, patch_text):
+    """Apply a strict, single-file unified diff atomically; never guess on mismatched context."""
+    p = Path(path)
+    raw = p.read_bytes()
+    try:
+        original = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("apply_patch only supports UTF-8 text files") from exc
+    if "\0" in original:
+        raise ValueError("apply_patch does not support binary files")
+
+    newline = "\r\n" if "\r\n" in original else "\n"
+    original = original.replace("\r\n", "\n").replace("\r", "\n")
+    source_lines = original.splitlines(keepends=True)
+    patch_text = patch_text.replace("\r\n", "\n").replace("\r", "\n")
+    patch_lines = patch_text.splitlines(keepends=True)
+
+    # Accept standard unified-diff file headers, but apply only the explicitly supplied target path.
+    i = 0
+    if patch_lines and patch_lines[0].startswith("--- "):
+        i = 1
+        if i >= len(patch_lines) or not patch_lines[i].startswith("+++ "):
+            raise ValueError("Unified diff has a --- header but no +++ header")
+        i += 1
+
+    hunk_re = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?:.*)?(?:\n)?$")
+    hunks = []
+    while i < len(patch_lines):
+        line = patch_lines[i]
+        match = hunk_re.match(line)
+        if not match:
+            if not line.strip():
+                i += 1
+                continue
+            raise ValueError(f"Expected a unified-diff hunk header at patch line {i + 1}")
+        old_start = int(match.group(1))
+        old_count = int(match.group(2) if match.group(2) is not None else 1)
+        new_count = int(match.group(4) if match.group(4) is not None else 1)
+        i += 1
+        old_lines, new_lines = [], []
+        seen_old = seen_new = 0
+        while i < len(patch_lines) and not patch_lines[i].startswith("@@ "):
+            body = patch_lines[i]
+            if body.startswith("\\ No newline at end of file"):
+                # Unified diff marks the preceding source/destination line as lacking a final newline.
+                if i == 0 or patch_lines[i - 1][0] not in " +-":
+                    raise ValueError("Unexpected no-newline marker in patch")
+                previous_kind = patch_lines[i - 1][0]
+                if previous_kind in " -":
+                    if not old_lines:
+                        raise ValueError("No source line before no-newline marker")
+                    old_lines[-1] = old_lines[-1].removesuffix("\n")
+                if previous_kind in " +":
+                    if not new_lines:
+                        raise ValueError("No destination line before no-newline marker")
+                    new_lines[-1] = new_lines[-1].removesuffix("\n")
+                i += 1
+                continue
+            if not body or body[0] not in " +-":
+                break
+            content = body[1:]
+            if body[0] in " -":
+                old_lines.append(content)
+                seen_old += 1
+            if body[0] in " +":
+                new_lines.append(content)
+                seen_new += 1
+            i += 1
+        if seen_old != old_count or seen_new != new_count:
+            raise ValueError(
+                f"Malformed hunk: header declares -{old_count}/+{new_count} lines, "
+                f"but body contains -{seen_old}/+{seen_new}"
+            )
+        hunks.append((old_start, old_count, old_lines, new_lines))
+
+    if not hunks:
+        raise ValueError("Patch contains no unified-diff hunks")
+
+    changed = list(source_lines)
+    offset = 0
+    for old_start, old_count, old_lines, new_lines in hunks:
+        index = (old_start if old_count == 0 else old_start - 1) + offset
+        if index < 0 or index > len(changed):
+            raise ValueError(f"Hunk position is outside the file (old line {old_start})")
+        actual = changed[index:index + old_count]
+        if actual != old_lines:
+            expected_text = "".join(old_lines[:4]).rstrip()
+            actual_text = "".join(actual[:4]).rstrip()
+            raise ValueError(
+                f"Patch context mismatch near line {old_start}; file was not changed. "
+                f"Expected: {expected_text!r}; found: {actual_text!r}"
+            )
+        changed[index:index + old_count] = new_lines
+        offset += len(new_lines) - old_count
+
+    updated = "".join(changed)
+    if newline != "\n":
+        updated = updated.replace("\n", newline)
+    encoded = updated.encode("utf-8")
+
+    # Write beside the destination and atomically replace it only after every hunk matches.
+    mode = stat.S_IMODE(p.stat().st_mode)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".patch-tmp", dir=str(p.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(encoded)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_name, mode)
+        os.replace(tmp_name, p)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return len(hunks), len(source_lines), len(changed)
+
+
 def build_server(cfg):
     from mcp.server.fastmcp import FastMCP
     from mcp.types import ToolAnnotations
@@ -483,7 +605,8 @@ def build_server(cfg):
         f"Local agent server running on {platform.system()} ({platform.machine()}). {scope_txt}\n"
         f"Default working directory: {ws}. Relative paths are resolved against it.\n"
         "Workflow: explore with list_directory/find_files/search_text, read with read_file, "
-        "change with edit_file (small precise edits) or write_file (new files), verify with run_command."
+        "apply_patch for contextual unified-diff edits, edit_file for small exact replacements, "
+        "write_file for new or complete files, then verify with run_command."
     )
 
     kwargs = dict(instructions=instructions, stateless_http=True, json_response=True)
@@ -686,6 +809,16 @@ def build_server(cfg):
                 f.write(text)
             return T("edited", p=p, n=n if replace_all else 1)
 
+        def apply_patch(path: str, patch: str) -> str:
+            """Apply a strict unified diff to one existing UTF-8 text file.
+            Accepts standard ---/+++ headers and one or more @@ hunks. Every hunk must match exactly;
+            the file is written atomically only after all hunks validate. Paths obey the active access level."""
+            p = resolve(path, must_exist=True)
+            if not p.is_file():
+                raise IsADirectoryError(T("not_file", p=p))
+            hunks, before, after = _apply_unified_diff(p, patch)
+            return f"Applied {hunks} hunk(s) to {p}; lines {before} -> {after}."
+
         def make_directory(path: str) -> str:
             """Create a directory (including parents)."""
             p = resolve(path)
@@ -712,6 +845,7 @@ def build_server(cfg):
 
         reg(write_file, destructive=True)
         reg(edit_file, destructive=True)
+        reg(apply_patch, destructive=True)
         reg(make_directory)
         reg(move_path, destructive=True)
         reg(delete_path, destructive=True)
