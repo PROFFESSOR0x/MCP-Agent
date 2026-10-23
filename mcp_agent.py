@@ -32,6 +32,11 @@ import time
 import re
 import asyncio
 import functools
+import logging
+import inspect
+import traceback
+import uuid
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -207,12 +212,85 @@ REQUIRED = {  # module name : pip spec
     "pymupdf": "PyMuPDF>=1.24",
 }
 VENV_DIR = Path.home() / ".claude_agent_mcp" / "venv"
+USER_DIR = Path.home() / ".mcp-agent"
+LOG_DIR = USER_DIR / "logs"
+ENV_FILE = USER_DIR / ".env"
 BOOT_FLAG = "MCP_AGENT_BOOT"
 ACCESS_LEVELS = ("read-only", "operate", "full")
+_LOGGER = logging.getLogger("mcp_agent")
+_LOGGER.setLevel(logging.INFO)
+_LOGGER.propagate = False
+
+
+def load_user_env():
+    try:
+        for raw in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key, value = key.strip(), value.strip().strip("\"'")
+            if re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+                os.environ.setdefault(key, value)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"[!] Could not read {ENV_FILE}: {exc}", file=sys.stderr)
+
+
+def save_env_value(key, value):
+    USER_DIR.mkdir(parents=True, exist_ok=True)
+    lines = ENV_FILE.read_text(encoding="utf-8").splitlines() if ENV_FILE.exists() else []
+    updated, found = [], False
+    for line in lines:
+        if line.strip().startswith(key + "="):
+            if not found:
+                updated.append(f"{key}={value}")
+                found = True
+        else:
+            updated.append(line)
+    if not found:
+        updated.append(f"{key}={value}")
+    fd = os.open(str(ENV_FILE), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write("\n".join(updated).rstrip() + "\n")
+    try:
+        ENV_FILE.chmod(0o600)
+    except OSError:
+        pass
+
+
+def redact_text(value, limit=12000):
+    text = str(value)
+    for secret in (os.environ.get("NGROK_AUTHTOKEN"), os.environ.get("MCP_AUTH_TOKEN")):
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    text = re.sub(r"(?i)(authorization\s*[:=]\s*bearer\s+)\S+", r"\1[REDACTED]", text)
+    text = re.sub(r"(?i)(--(?:ngrok-)?authtoken|--token)(\s+|=)\S+", r"\1\2[REDACTED]", text)
+    text = re.sub(r"(?i)(token|password|secret|api[_-]?key)(\s*[=:]\s*)[^\s,;]+", r"\1\2[REDACTED]", text)
+    text = re.sub(r"(/)[A-Za-z0-9_-]{24,}(/mcp)", r"/ [REDACTED] \2", text)
+    return text[:limit] + (f"... [truncated {len(text)-limit} chars]" if len(text) > limit else "")
+
+
+def setup_logging():
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        USER_DIR.chmod(0o700)
+        LOG_DIR.chmod(0o700)
+    except OSError:
+        pass
+    handler = RotatingFileHandler(LOG_DIR / time.strftime("%Y-%m-%d.log"), maxBytes=10 * 1024 * 1024,
+                                  backupCount=5, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    _LOGGER.addHandler(handler)
+    _LOGGER.info("session_start pid=%s python=%s args=%s", os.getpid(), sys.version.split()[0],
+                 redact_text(" ".join(sys.argv[1:])))
 
 
 def log(msg):
     print(msg, flush=True)
+    if _LOGGER.handlers:
+        _LOGGER.info("%s", redact_text(msg))
 
 
 def die(msg, code=1):
@@ -231,12 +309,40 @@ def parse_args():
     ap.add_argument("--port", type=int, default=8765, help=T("h_port"))
     ap.add_argument("--token", default=os.environ.get("MCP_AUTH_TOKEN"), help=T("h_token"))
     ap.add_argument("--domain", default=None, help=T("h_domain"))
+    ap.add_argument("--save-domain", metavar="DOMAIN", help="Save a static ngrok domain for future runs")
+    ap.add_argument("--auto", action="store_true", help="Use saved MCP-Agent settings")
+    ap.add_argument("--random-url", action="store_true", help="Ignore saved static domain for this run only")
+    ap.add_argument("--show-config", action="store_true", help="Show saved settings with secrets redacted")
+    ap.add_argument("--logs", action="store_true", help="Print recent logs and exit")
     ap.add_argument("--ngrok-authtoken", default=None, help=T("h_ngtok"))
     ap.add_argument("--no-ngrok", action="store_true", help=T("h_nongrok"))
     ap.add_argument("--no-exec", action="store_true", help=T("h_noexec"))
     ap.add_argument("--max-timeout", type=int, default=600, help=T("h_timeout"))
     ap.add_argument("--lang", "-lang", default=LANG, choices=["ar", "en"], help=T("h_lang"))
     cfg = ap.parse_args()
+    if cfg.show_config:
+        print(f"Config: {ENV_FILE}\nLogs: {LOG_DIR}\nAUTO_NGROK={os.environ.get('AUTO_NGROK', 'false')}\nNGROK_DOMAIN={os.environ.get('NGROK_DOMAIN', '(not set)')}\nNGROK_AUTHTOKEN={'[configured]' if (os.environ.get('NGROK_AUTHTOKEN') or cfg.ngrok_authtoken) else '(not set)'}")
+        raise SystemExit(0)
+    if cfg.logs:
+        files = sorted(LOG_DIR.glob("*.log")) if LOG_DIR.exists() else []
+        if not files:
+            print("No logs found.")
+        else:
+            content = "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in files[-2:])
+            print("\n".join(content.splitlines()[-200:]))
+        raise SystemExit(0)
+    if cfg.save_domain:
+        if not re.fullmatch(r"[A-Za-z0-9.-]+", cfg.save_domain):
+            ap.error("Invalid domain format")
+        save_env_value("NGROK_DOMAIN", cfg.save_domain)
+        save_env_value("AUTO_NGROK", "true")
+        print(f"Saved static domain to {ENV_FILE}; it will be used on future runs.")
+        raise SystemExit(0)
+    saved_domain = os.environ.get("NGROK_DOMAIN")
+    if not cfg.random_url and not cfg.domain and saved_domain and os.environ.get("AUTO_NGROK", "false").lower() in ("1", "true", "yes", "on"):
+        cfg.domain = saved_domain
+    if cfg.random_url:
+        cfg.domain = None
 
     cfg.access = "read-only" if cfg.access == "readonly" else cfg.access
 
@@ -640,16 +746,35 @@ def build_server(cfg):
         def short(kw):
             s = ", ".join(f"{k}={str(v)[:60]!r}" for k, v in kw.items())
             return s[:200]
-        if asyncio.iscoroutinefunction(fn):
+        def record(direction, name, payload, call_id):
+            if _LOGGER.handlers:
+                _LOGGER.info("tool_%s id=%s name=%s payload=%s", direction, call_id, name, redact_text(payload, 12000))
+        if inspect.iscoroutinefunction(fn):
             @functools.wraps(fn)
             async def w(*a, **k):
+                call_id = uuid.uuid4().hex[:12]
+                record("IN", fn.__name__, {"args": a, "kwargs": k}, call_id)
                 log(f"[tool] {time.strftime('%H:%M:%S')} {fn.__name__}({short(k)})")
-                return await fn(*a, **k)
+                try:
+                    result = await fn(*a, **k)
+                    record("OUT", fn.__name__, result, call_id)
+                    return result
+                except Exception as exc:
+                    record("ERROR", fn.__name__, {"error": repr(exc), "traceback": traceback.format_exc()}, call_id)
+                    raise
         else:
             @functools.wraps(fn)
             def w(*a, **k):
+                call_id = uuid.uuid4().hex[:12]
+                record("IN", fn.__name__, {"args": a, "kwargs": k}, call_id)
                 log(f"[tool] {time.strftime('%H:%M:%S')} {fn.__name__}({short(k)})")
-                return fn(*a, **k)
+                try:
+                    result = fn(*a, **k)
+                    record("OUT", fn.__name__, result, call_id)
+                    return result
+                except Exception as exc:
+                    record("ERROR", fn.__name__, {"error": repr(exc), "traceback": traceback.format_exc()}, call_id)
+                    raise
         return w
 
     def reg(fn, read_only=False, destructive=False, open_world=False):
@@ -962,7 +1087,7 @@ def build_server(cfg):
         async def invoke(name, args):
             fn = tool_registry[name]
             try:
-                if asyncio.iscoroutinefunction(fn):
+                if inspect.iscoroutinefunction(fn):
                     result = await fn(**args)
                 else:
                     result = await asyncio.to_thread(fn, **args)
@@ -1143,9 +1268,20 @@ def run(cfg):
 
 
 def main():
-    cfg = parse_args()
-    bootstrap()
-    run(cfg)
+    load_user_env()
+    setup_logging()
+    try:
+        cfg = parse_args()
+        bootstrap()
+        run(cfg)
+    except SystemExit as exc:
+        _LOGGER.info("session_exit code=%s", exc.code)
+        raise
+    except Exception:
+        _LOGGER.exception("unhandled_exception")
+        raise
+    finally:
+        _LOGGER.info("session_end")
 
 
 if __name__ == "__main__":

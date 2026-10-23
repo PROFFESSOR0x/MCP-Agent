@@ -27,6 +27,25 @@ Run `mcp_agent.py` and connect any client that supports Remote MCP to your compu
 
 The interface language can be selected with `--lang` or `-lang`. See [Language selection](#language-selection).
 
+## Persistent settings and logs
+
+MCP-Agent stores user-level settings and logs in `~/.mcp-agent/` (independent of the checkout). Daily logs are written to `~/.mcp-agent/logs/`, rotated at 10 MiB with up to five backups. Tool calls log inputs, outputs, and exceptions with sensitive values redacted and payloads capped.
+
+```bash
+# Save a static ngrok domain (requires a domain assigned to your ngrok account)
+python mcp_agent.py --save-domain your-name.ngrok-free.app
+
+# Use the saved domain automatically; override it for one run with a random URL
+python mcp_agent.py --auto
+python mcp_agent.py --random-url
+
+# Inspect configuration (secrets are not displayed) and recent logs
+python mcp_agent.py --show-config
+python mcp_agent.py --logs
+```
+
+The user `.env` file is created with owner-only permissions. Keep it private; it may contain the ngrok authtoken.
+
 ## Quick start
 
 Requirements: Python 3.10 or newer. A working ngrok account is needed only when using the public tunnel.
