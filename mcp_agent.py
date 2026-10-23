@@ -1196,7 +1196,12 @@ def start_tunnel(port, cfg):
         try:
             opts = {}
             if cfg.domain:
-                opts["domain"] = cfg.domain
+                # ngrok agent v3 endpoint schema uses `url`; `domain` is a
+                # legacy tunnel option and causes HTTP 400 on recent agents.
+                domain_url = cfg.domain.strip()
+                if not domain_url.startswith(("https://", "http://")):
+                    domain_url = "https://" + domain_url
+                opts["url"] = domain_url
             tunnel = ngrok.connect(port, "http", **opts)
             url = tunnel.public_url
             return url.replace("http://", "https://", 1) if url.startswith("http://") else url
